@@ -86,8 +86,8 @@ services:
       context: .
       target: jupyter-notebook
     depends_on:
-      spark-master:
-        condition: service_healthy
+      # spark-master:
+      #   condition: service_healthy
       # spark-connect:
       #   condition: service_started
     volumes:
