@@ -1,0 +1,692 @@
+----------------------------------------------------------
+Setting spark on Docker 开头
+
+setup spark环境有很多种，例如最方便的就是cloud service例如AWS EMR， AWS Glue，
+或者是Databricks platform，但是自学往往会选择花费最小的方法，
+那就是local，local可以选择下载spark和java，直接在jupyter notebook写program，
+而这个方式有很大的缺点，就是很容易出现bug，我为了验证我的代码不能运行的原因
+不出自于代码syntax的问题，我使用了databricks free edition来跑同样的代码，
+却成功运行。证明我local的配置出现了问题，但是我不太会处理，以及很费时间解决。
+我最后找到了一个最适合免费学习spark的部署方式，就是使用docker。
+
+docker可以。。。（说说docker的好处，例如docker不仅能确保版本不冲突，
+方便其他人的电脑快速配置同样的环境，不会出现java.io.IOException问题，
+还能setup一个伪集群standalone cluster，在同台电脑启动多个worker nodes）
+
+----------------------------------------------------------
+Why start with Dockerfile?
+
+为什么 Spark on Docker 需要 Dockerfile
+简单来说：我们需要定制环境（即写Dockerfile）
+
+首先定制环境就是说我们要固化配置，把复杂设置写下来，例如要一键启动集群，说明要多少个worker之类的，设置node之间的网络通信。
+Docker 官方没有提供"开箱即用"的 Spark 集群镜像，只有一个基础版本。
+官方提供的基础镜像（如 apache/spark:latest）只是一个准备好spark环境的模板，里面安装好了Java,Spark,Python等运行依赖，
+但是它不启动任何spark（服务），到底是运行local, standalone, 还是yarn模式。
+运行什么服务由我们决定，直接使用的话需要每次写配置（一次性）。
+所以想要设置standalone cluster要把配置写进dockerfile，这样就不需要重写配置。
+
+如果没有 Dockerfile 会怎样？
+    # 每次启动都要输入一长串的命令
+    docker run -p 8080:8080 -p 7077:7077 ... apache/spark:latest
+    # 还要手动配置：
+    # - 环境变量
+    # - 网络连接
+    # - 文件路径
+    # - 多个容器之间的通信
+
+具体问题：
+- 每次重来：关闭容器后，所有配置都丢失
+- 容易出错：手动输入容易打错命令
+- 无法复制：别人无法快速搭建相同环境
+- 管理困难：多个容器配置无法统一管理
+
+Dockerfile 解决了什么？
+把配置"写死"在镜像里
+Example：
+    FROM apache/spark:3.4.0
+    # 一次性设置好所有配置
+    ENV SPARK_HOME=/opt/spark
+    ENV PATH=$SPARK_HOME/bin:$PATH
+    EXPOSE 7077 8080
+
+实际好处
+一键构建：docker build 就能创建定制镜像
+永久保存：配置不会丢失（已经写进dockerfile了）
+大家共享：团队都可以用相同的环境（相同的dockerfile）
+
+----------------------------------------------------------
+Dockerfile: How to Write?
+
+Dockerfile的结构是这样的：
+我们在一开始写FROM，用来定义开头
+FROM之后的代码都是配置该base environment的commands
+
+    FROM python:3.11-bullseye as spark-base
+    ...
+    FROM spark-base as pyspark-base
+    ...
+    FROM pyspark-base as pyspark
+    ...
+    FROM pyspark-base as jupyter-notebook
+    ...
+
+后续的base是继承了上一层base的配置,然后进一步配置。例如：
+1. spark-base基于python:3.11-bullseye基础镜像更进一步install和setup环境，例如apt-get, ENV SPARK_HOME, ENV HADOOP_HOME和RUN curl等等。
+2. pyspark-base继承了spark-base上面的所有配置，不要忘记最底层还是基于python3:11-bullseye。
+3. pyspark和jupyter-notebook都是基于pyspark-base，但是additional配置属于各自的环境。
+
+最终生成的镜像:
+    1. pyspark
+    2. jupyter-notebook
+
+python:3.11-bullseye
+        ↓
+   spark-base  (安装Java、Spark基础环境)
+        ↓
+  pyspark-base (安装Python依赖包)
+        ├───── pyspark              (配置Spark环境 + entrypoint)
+        ├───── jupyter-notebook     (配置Jupyter环境)
+
+为什么分成spark-base和pyspark-base？
+1. 构建缓存优化（两层写在一起会比较慢）
+2. 未来扩展性（未来可能不需要pyspark，例如换成scala-base）
+3. 依赖管理清晰（spark-base是系统级依赖，pyspark-base是应用级依赖）
+4. 便于实际开发（开发时会频繁修改，可能会重复运行某样东西）
+
+
+----------------------------------------------------------
+Detail of Each Base
+----------------------------------------------------------
+FROM python:3.11-bullseye as spark-base
+
+    python:3.11-bullseye = 在Debian 11(Bullseye) OS之上，安装了Python 3.11
+    简单来说，在Bullseye OS用python 3.11来跑PySpark。
+
+    为什么这里选择python:3.11-bullseye?
+        PySpark需要Linux层级依赖（例如Java，SSH，build工具），
+        Spark官方推荐Debian/Ubuntu依赖
+        Spark安装指南大部分针对Debian/Ubuntu写
+        apt-get可以直接安装Java，curl，vim，ssh等
+        Debian大小适中（1GB），不像ubuntu那么大，不像alpine那么轻但容易出错
+        所以适合作为PySpark基础环境。
+
+    ARG SPARK_VERSION=3.4.0
+
+    定义 SPARK_VERSION，后续下载spark时会用到。
+    由于version字眼出现很多次，所以要改version，这样写只需要改一次
+    ARG只在Docker Image构建时有效，构建完容器运行时变量就消失
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        openjdk-11-jdk \
+        sudo \
+        curl \
+        vim \
+        ssh && \
+        unzip \
+        rsync \
+        build-essential \
+        software-properties-common \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    - 更新软件包列表
+    - 安装必要的系统工具，包括sudo、curl、Java 11等
+    - 清理缓存减小镜像大小
+    简单来说就是安装spark运行需要的系统工具和java
+
+ENV SPARK_HOME=${SPARK_HOME:-"/opt/spark"}
+ENV JAVA_HOME="/usr/lib/jvm/java-11-openjdk-amd64"
+
+    ENV 是 定义环境变量
+    - SPARK_HOME 变量
+    - JAVA_HOME 变量
+    如果基础镜像还没设置，默认用/opt/spark
+    /opt 是Linux约定的"第三方app安装目录"
+
+    为什么要定义环境变量？
+    Spark和Python需要知道Spark的安装位置
+    在写PySpark代码 or Shell command的时候，会用到spark library，
+    library就在我们下载的spark里面，但是编译器或系统辨识不到写的代码是什么
+    所以有了SPARK_HOME，他们就知道代码在写着什么。
+
+RUN mkdir -p ${SPARK_HOME}
+
+    创建 Spark 的安装目录
+    - p 确保如果已经存在，不会报错；如果不存在，就自动创建
+
+    为什么？
+    后续RUN curl 安装spark就装在这里
+
+WORKDIR ${SPARK_HOME}
+
+    切换当前工作目录成 ${SPARK_HOME}
+
+    为什么？
+    后续命令都在这个目录下执行
+    因此下面的RUN curl就是在这个目录下安装spark
+    例如ENV默认是/opt/spark，那么RUN curl下载包就放在/opt/spark
+
+RUN curl https://dlcdn.apache.org/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz -o spark-${SPARK_VERSION}-bin-hadoop3.tgz \
+ && tar xvzf spark-${SPARK_VERSION}-bin-hadoop3.tgz --directory /opt/spark --strip-components 1 \
+ && rm -rf spark-${SPARK_VERSION}-bin-hadoop3.tgz
+
+    根据开头 `ARG SPARK_VERSION=3.4.0`定义的version
+    RUN curl 是下载二进制包 `spark-3.4.0-bin-hadoop3.tgz`
+    RUN tar 是解压 spark
+    RUN rm 是删除临时压缩包，保持镜像干净
+
+----------------------------------------------------------
+FROM spark-base as pyspark-base
+
+# Install python deps
+COPY requirements/requirements.txt .
+RUN pip3 install -r requirements.txt
+
+    在写这dockerfile代码之前，
+    创建 requirements/requirements.in，写入需要用到的依赖的库
+    例如：
+        ipython
+        pandas
+        pyarrow
+        numpy
+        pyspark==3.4.0
+    然后
+    1. console运行 pip install pip-tools
+    2. console运行 pip-compile requirements/requirements.in
+    生成 requirements.txt，这是库和它的依赖的确切版本
+    
+    .in 是.txt的上游源文件，用来列出（声明）直接依赖的库
+    用command生成.txt，自动解析所有间接依赖
+    
+    为什么用这样的做法？
+    确保不同电脑下运行环境版本一致，以及易于更新
+    当下次想更新那些依赖库，就只需重新运行pip-compile
+    requirements.txt会自动更新
+
+    注意：
+    .in 必须声明pyspark的版本和SPARK_VERSION 相同
+    如果在.in 只写pyspark（不带版本），pip-compile 会去 PyPI 
+    查找最新的 pyspark 版本（比如 3.5.1）。
+    然后它会生成一个包含 pyspark==3.5.1 的 requirements.txt。
+    结果：版本不匹配，因为RUN curl是下载3.4.0。
+
+    - FROM ... = Uses the previously built spark-base image as starting point
+    - COPY ... = Copies the file to current WORKDIR in container
+    - RUN ... = Installs all Python packages listed in the txt file
+
+    有了这些需要的python库，就可以直接import直接用
+
+    为什么要特地写pyspark-base?
+    - Docker层缓存优化 (多阶段 Multi-stage)
+        如果要改 Spark版本, 只重建spark-base
+        如果要改requirements.txt，例如增加/删除依赖库，只重建pyspark-base
+        原理是Docker的构建是使用Layer Cache，每个command（RUN，ENV，ARG）都会生成一个layer
+        如果之前那一层的内容和命令都没变，Docker会直接复用旧cache
+        这样缓存更高效，频繁修改可以节省很多构建时间
+    - 支持不同的Spark APP
+        不同APP，共享同一个spark-base
+        例如scala spark或者另一个Pyspark
+
+    为什么RUN curl install spark了，又再pip install requirements中的pyspark
+    - 因为RUN curl的那个是engine（JVM），而pyspark是允许用python操控spark的python lib
+
+----------------------------------------------------------
+FROM pyspark-base as pyspark
+
+    开始一个新的构建阶段,命名为 pyspark。它继承pyspark-base的所有内容，且包括spark-base
+    为什么开新的构建阶段？
+    因为这是我们最终要运行的image，它包含了所有dependencies，
+    现在我们只需要添加 ‘特定于运行pyspark的配置’。
+
+ENV PATH="${JAVA_HOME}/bin:${SPARK_HOME}/sbin:${SPARK_HOME}/bin:${PATH}"
+
+    设置 PATH 环境变量
+
+    ${JAVA_HOME}/bin
+        让 shell 可以找到 Java 命令
+    ${SPARK_HOME}/bin 让 shell 
+        可以找到用户命令，如 spark-submit, spark-shell, pyspark
+    ${SPARK_HOME}/sbin 
+        让 shell 可以找到管理脚本，如 start-master.sh 和 start-worker.sh (他们在sbin/里)
+    :${PATH}
+        保留base image中原有的 PATH (如 /usr/bin), 
+        这样 python3, ls, bash 等basic command才可以用
+    
+    为什么 ENV PATH？
+        这告诉container (debian) 的shell在哪里查找可执行文件
+        先前在spark-base设定了环境变量以及他们安装的位置，即SPARK_HOME, JAVA_HOME
+        但是还没告诉Debian系统他们就在那个位置，所以要用ENV PATH 指定
+
+        没有设置 ENV PATH 时：
+            /opt/spark/bin/spark-submit my_script.py
+        设置 ENV PATH 后：
+            spark-submit my_script.py
+
+    为什么在 pyspark 设置 ENV PATH 而不是写在 pyspark-base?
+        这是基于‘职责分离和Docker缓存优化’的考虑
+        职责分离:
+            - 基础安装 → 依赖安装 → 环境配置
+            - spark-base: 只负责安装 Spark 和 Java
+            - pyspark-base: 只负责安装 Python 依赖包
+            - pyspark: 负责最终的运行时配置
+        缓存优化:
+            - 或许 requirements 会经常修改，所以尽量少放东西在pyspark-base
+
+    小小补充：
+    pyspark 与 jupyter-notebook之间的职责分离
+        pyspark-base 是一个共享的基础 shared base。
+        两个最终image都继承 pyspark，但他们的职责是不同的：
+            pyspark
+                职责：它被设计用来运行 Spark服务 Master或Worker 
+                    (Master = 1台pyspark的spark-master | Worker = 2台pyspark的spark-worker-1)
+                需求：它必须能够执行 start-master.sh 和 start-worker.sh
+                结论：因此，它需要 ${SPARK_HOME}/sbin 在 PATH 中 （设置 ENV PATH）
+            
+            jupyter-notebook
+                职责：它被设计用来作为客户端运行一个Jupyter notebook
+                需求：它只需要能 import pyspark (pip 已安装)，然后连接到一个远程的Spark Master
+                    (注意它会设置一个 ENV SPARK_REMOTE)
+                结论：它根本不需要运行 start-master.sh 或 start-worker.sh。
+                    因此，它不需要 ${SPARK_HOME}/sbin 在 PATH 中
+
+        pyspark-base
+            只提供已安装的软件。它是一个通用的，未配置的基础
+        pyspark
+            添加它作为 服务 所需的运行时配置 (即 sbin 路径和 entrypoint.sh)
+        jupyter-notebook 
+            添加它作为 客户端 所需的运行时配置 (即 pip install jupyter 和 CMD)
+
+        通过将 ENV PATH 放在 pyspark 阶段，保持了 pyspark-base的清洁和通用性
+        使其可以被不同运行时配置的最终image完美地服用。
+
+ENV SPARK_MASTER="spark://spark-master:7077"
+
+    这里被comment掉了, 
+    因为 spark-defaults.conf 里面负责declare spark.master URL
+    如果这里再声明就属于冗余。
+    
+    为什么选择删掉 SPARK_MASTER 删掉而不是 spark.master ？
+        基于以下考虑：
+        1.  单一配置  ：所有客户端（Worker + App）都从同一个 spark-defaults.conf 
+                    获取 Master 地址，避免配置分散
+        2.  优先级控制：环境变量优先级高，容易意外覆盖代码或配置文件中的设置
+        3.  运维一致性：生产环境中通常通过配置文件管理集群配置，而不是环境变量
+        因为 Worker 和 App 被设计为自动获取 conf 文件
+        所以conf 优先级最低，如果没把优先级较高的SPARK_MASTER删掉，
+        万一只修改 spark.master,系统会采用没被修改的SPARK_MASTER (优先级较高),
+        导致新地址spark.master被覆盖
+
+    Spark 配置的优先级:
+        1. 代码显式设置  (SparkSession.builder.master(...))
+        2. 命令行参数    (--master spark://...)
+        3. ENV         (SPARK_MASTER)
+        4. spark-defualts.conf
+        5. Spark 默认值
+    
+    代码原理：
+    这是 客户端 用来连接 Master 服务的 URL address
+
+    客户端 = 是个进程，主动发起连接，去连接到 Spark Master 服务。(Connect)
+        1. Spark Worker
+            它由 start-worker.sh 启动
+            它是一个客户端，因为它必须连接到 Master 才能报到，告诉 Master 它有多少资源
+            并等待 Master 分配任务
+        2. Spark App (Driver/Shell Commands)
+            它由 spark-submit / SparkSession 启动
+            它也是一个客户端，因为它必须连接到 Master，请求 Master 在 Worker 节点上
+            为 App 分配 Executor
+
+ENV SPARK_MASTER_HOST spark-master
+ENV SPARK_MASTER_PORT 7077
+
+    这些ENV都是服务端用来启动/绑定自己服务的
+    换句话说，它们是服务端占用一个port，等待别人连接，要提供的信息 (hostname 和 port number)
+
+    服务端 = Spark Master (start-master.sh)，它启动服务
+            在7077 port上监听和等待连接 (bind 7077 → listen to client → accept)
+            只要是提供服务就有port number
+    
+    关键点
+        spark-master 不是随便写的字符串，它是 Docker 网络中的有效主机名
+        在 docker-compose.yml 中，这个 hostname (spark-master) 会被解析到 
+        Master 容器的 IP address
+
+    总结    
+        客户端的配置 (Worker 和 App 用的)：
+            spark-defaults.conf 里的 spark.master
+            目的：告诉 Worker 和 App 去哪里连接 Master。
+        服务端的配置 (Master 用的)：
+            ENV SPARK_MASTER_HOST
+            ENV SPARK_MASTER_PORT
+            目的：告诉 Master 在哪里启动服务（绑定）。
+        这些配置会在 entrypoint.sh 调用 start-master.sh 或 start-worker.sh 的时候被使用
+            start-master会自动得到需要 ENV变量 来绑定服务 (host & port)
+            start-worker会找出连接 master 的 URL ($SPARK_HOME/conf/spark-defaults.conf的spark.master)
+            Spark App 也会从这个 conf 得到 URL 来连接 master
+        
+    补充：
+    ENV和.conf的区别
+        1. .conf
+            方式：主动查找
+            App (spark-submit & SparkSession) 和 start-worker.sh 启动时，
+            主动去找conf读取spark.master
+        2. ENV
+            方式：被动继承
+            Docker启动container，并在执行任何命令之前，就把 ENV变量 注入到container的根shell环境中
+            entrypoint.sh 自动继承了所有 ENV 变量
+            start-master.sh 同样也就知道 ENV 变量
+            只要这个.sh直接使用 ENV变量，shell就会自动把它替换成 spark-master
+            (类似 Global Variable, but container-level)
+    
+
+ENV PYSPARK_PYTHON python3
+
+    PYSPARK_PYTHON 是一个Spark官方会识别和读取的 ENV
+    告诉 Spark Executor 在需要执行 Python 代码时，应该使用系统上的哪个 Python 可执行文件。
+    为什么?
+    没有这个设置，Spark Executor 可能会尝试调用 python，
+    python在很多现代 Linux 系统中可能不存在（或指向 Python 2）。
+    我们明确告诉它使用我们安装的 python3。
+    再来是Spark 3就是对应使用 python 3
+
+    额外补充：
+    PYSPARK_DRIVER_PYTHON 是另一个ENV 用来告诉 Spark Driver 执行哪个Python
+    强调 PYSPARK_PYTHON 是针对 Executor，不是 Driver
+
+COPY conf/spark-defaults.conf "$SPARK_HOME/conf"
+
+    Copy .conf 文件到 /opt/spark/conf 目录下
+
+    /opt/spark/conf 是 Spark自动加载配置的默认位置。
+    当任何 Spark进程 (Master, Worker, App) 启动时，它都会自动去这个目录
+    查找 spark-defaults.conf, 并加载里面的所有设置
+
+    内容：
+    spark.master                           spark://spark-master:7077
+    spark.eventLog.enabled                 true
+    spark.eventLog.dir                     /opt/spark/spark-events
+    spark.history.fs.logDirectory          /opt/spark/spark-events
+
+    spark.master = 前面提到的URL，客户端用来连接SPARK MASTER
+    
+    接着的3行都是关于启用Spark History Server
+    History Server 是一个独立的Web UI， 它能让你在Spark App运行完成之后，回去review
+    它的所有Job, Stage 和 Task 的执行情况， 方便 Debug 和 Performance Optimization
+
+    spark.eventLog.enable = True
+        Driver 要记录所有运行事件(Job 启动, Task 完成, Stage 划分)，
+        并写入到一个 log 文件中
+        如果这个值=False，下面两个配置都是没有意义的
+
+    spark.eventLog.dir = /opt/spark/spark-events
+        Driver 要把 log文件 保存到 .../spark-events
+        每当App运行 (App-1) 时，它就会在这个目录下创建一个自己的log文件
+        (例如 /opt/spark/sparrk-events/app-1-log)
+
+    spark.history.fs.logDirectory = /opt/spark/spark-events
+        配置 for Spark History Server
+        这个server是单独启动的，在 18080 port
+        History Server 要去这个logDirectory 读取所有log，并展示在Web UI界面上
+
+
+RUN chmod u+x /opt/spark/sbin/* && \
+    chmod u+x /opt/spark/bin/*
+
+    确保 /sbin/* 和 /bin/* 的所有文件都绝对是可以被执行的
+
+    chmod   = change mode
+    u+x     = User Add Execute
+    为这个文件的 所有者 添加 可执行文件
+
+    为什么要chmod u+x？
+    start-master.sh, start-worker 和 spark-submit 都是脚本
+    在 Linux系统中，你不能运行一个文件，除非它被明确标记为‘可执行’
+    如果没有 x权限 就尝试运行的话，系统会报错
+
+    这个部分可能是optional的，原因是：
+    1. Spark的压缩包 tgz 会保存其内部所有文件的权限信息
+    2. RUN tar ‘或许’会读取这些权限信息，并在解压时原封不动的将它们应用到新解压的文件上
+
+ENV PYTHONPATH=$SPARK_HOME/python/:$PYTHONPATH
+
+    PYTHONPATH 是什么?
+    Python Interpreter 会在 PYTHONPATH 中找到 Module 和 Package 
+    (import pandas or import pyspark)
+
+    PYTHONPATH=$SPARK_HOME/python/:$PYTHONPATH
+    意思: 在原有PATH的列表加入 “$SPARK_HOME/python/”, 并且是加在前面
+
+    PYTHONPATH 可以有很多个path，每个path用':' 分隔
+    Python会按顺序搜索列表:
+    1. /opt/spark/python/   # 新添加的路径
+    2. /usr/local/lib/python3.11/site-packages # 原有的路径
+    3. /usr/lib/python3.11  # 系统标准库
+    4. ...
+
+    系统会优先选择 /opt/spark/python/
+
+    背景 (*还没加入PYTHONPATH):
+    现在有两个地方有PySpark的Python库
+    1. /usr/local/lib/python3.11/site-packages/pyspark
+        来源: pip3 install requirements.txt
+        职责: 提供前端Driver API, 负责发起任务
+        关键点: 已在默认 PYTHONPATH 中
+    2. /opt/spark/python
+        来源: RUN curl Spark.tgz
+        职责: 负责后端实现，Spark在Executor上执行代码需要的库 (重点是pyspark.zip)
+        关键点: 默认不在PYTHONPATH中
+    
+    问题:
+    既然已经 pip install pyspark了，它的路径自动默认在PYTHONPATH中，本该不需要额外设置PYTHONPATH
+    为什么还需要设置 PYTHONPATH 指向 /opt/spark/python
+
+    回答:
+    1.  先理解Spark Architecture
+        根据上面提到的，
+        Driver 使用 /usr/local/lib/python3.11/site-packages/pyspark
+        = 写代码用的
+        Worker/Executor 使用 /opt/spark/python
+        = 集群执行用的
+    2.  工作流程
+        Driver启动 (提交Job) 时, import pyspark 会找到lib installed by pip
+        然后这个lib需要 Executor的lib (pyspark.zip) 打包和分发到所有的Workers
+        这样Executor才能知道如何执行我们写的代码，否则失败
+    3.  深入解释 (涉及Spark的设计原则)
+        Spark的设计 Driver 和 Executor 是完全独立的进程，运行在不同的机器上
+        因为它是个unified engine
+        Spark必须保证自己能在任何环境下工作，因此不能假设Executor已经安装了pyspark
+        这就是为什么Worker即使是同一个pyspark image 构建的container也没用的原因
+    
+    题外话
+    得出Spark的Unified Engine牺牲了专门优化：
+    代价=不如专用系统快
+        Spark Streaming（微批次）无法达到真正流式系统（如 Flink、Kafka Streams）的低延迟。
+        Spark SQL 再优化也不如专用的查询引擎（如 Presto、DuckDB）快。
+        MLlib 无法与 TensorFlow 或 PyTorch 这样的深度学习框架匹敌。
+    这里不需要理解太深,总而言之,我们不设置这行代码就会失败
+
+    重点是这么做的意义是什么？
+    1. 获得“开发的便利性” (Developer-Friendly)
+        因为 pip install pyspark 了，IDE（比如 VS Code）就能识别 PySpark 库。
+        结果:
+        在编写代码时能得到自动补全, 语法高亮和类型检查。
+        编辑器不会在 import pyspark 下面划红线。这极大地提高了开发效率。
+    2. 获得“集群的完整性” (Cluster-Ready)
+        因为下载了完整的 .tgz 包，拥有了完整的 Spark Engine
+        结果：IDE 能正确地将任务分发到 Executor
+    3. 可使用 python3 XXX.py 提交Job (除了spark-submit)
+
+    对比"既没有pip install pyspark，也没有设置PYTHONPATH"的Docker:
+        没有pyspark包就不需要设置 PYTHONPATH 指向 /opt/spark/python
+        
+        仍然成功运行 spark-submit，
+        因为它在执行你的 my_app.py 之前，
+        会自动、临时地把 /opt/spark/python 和 pyspark.zip 添加到 PYTHONPATH 中。
+        spark-submit 脚本自己处理了库的链接。
+
+        但是有缺点：
+        1.  IDE 不友好，IDE 看不到任何 pyspark 库（因为它被藏在 /opt/spark/python 里），
+            import pyspark 会全都是红线。等于是在“盲写”代码。
+        2.  不能 python3 XXX.py 提交 job
+
+COPY entrypoint.sh .
+ENTRYPOINT ["./entrypoint.sh"]
+
+    ENTRYPOINT 定义了container的启动命令
+    将Docker image变成一个可以运行的应用程序
+
+    COPY entrypoint.sh . = 把本地的entrypoint.sh 复制到WORKDIR(/opt/spark)中
+    ENTRYPOINT = 当Docker启动container时，它唯一会运行的的命令就是这个脚本
+    
+    容器启动后发生的所有事情(比如启动Master/Worker), 都是在这个sh脚本内部控制的
+    它用同一个镜像来充当 Master 和 Worker
+
+    ENTRYPOINT是在最后一行进行的，
+    在所有ENV设置好，好需要的东西安装，权限设置好后
+    ENTRYPOINT 被docker-compose启动，
+    所以启动后的这个Master/Worker是自动继承了所有Dockerfile写的所有要求
+
+    entrypoint.sh的内容
+        1. master
+        2. worker
+        3. history
+        4. connect
+        判断 $SPARK_WORKLOAD 与其中1个对应，
+        if 对应，then 执行 start-xxx.sh
+
+        SPARK_WORKLOAD = $1
+        $1 指的是传递给它的第一个命令行参数
+        $1 是由docker-compose传给它的
+        
+        docker-compose.yml中，
+        services:
+            spark-master:
+                ...
+                entrypoint: ['./entrypoint.sh', 'master']
+                ...
+            spark-worker:
+                ...
+                entrypoint: ['./entrypoint.sh', 'worker']
+                ...
+        总结，docker-compose传递值到Dockerfile的entrypoint来决定services
+    
+    除了 ENTRYPOINT ["./entrypoint.sh"]
+    也可以用 ENTRYPOINT ["/bin/bash"]
+    这个方式用来开发和调试阶段
+
+----------------------------------------------------------
+FROM pyspark-base as jupyter-notebook
+
+    开一个jupyter-notebook构建阶段
+    继承pyspark-base，包含：
+    Java，Spark Engine
+    requirements.txt的lib
+
+ARG jupyterlab_version=4.0.1
+
+    定义一个构建时变量，用于指定要安装的jupyterlab版本
+
+ENV SPARK_REMOTE="sc://spark-connect:15002"
+
+    这是关键配置
+    它没有使用我们之前讨论的 spark:// 协议，而是使用了 sc://
+    sc:// = Spark Connect。
+    Spark Connect 是 Spark 3.4.0 中引入的一个新功能。
+
+    关键区别：
+    spark//
+        ...
+    sc://
+        ...
+
+RUN mkdir /opt/notebooks
+
+    创建一个用于存放 .ipynb 笔记本文件的目录
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends python3-dev build-essential && \
+    pip3 install --upgrade pip && \
+    pip3 install wget jupyterlab==${jupyterlab_version} && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+    安装
+    1. python3-dev, build-essential
+    2. upgrade pip
+    3. jupyterlab
+    4. clean apt
+
+WORKDIR /opt/notebooks
+
+    将 WORKDIR 切换到 /opt/notebooks
+    这样，当运行 CMD 中的 jupyter lab 命令时，它会默认在这个WORKDIR中启动，你创建和保存的 .ipynb 文件都会存放在这里。
+
+CMD jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token=
+
+    设置container启动时默认执行的命令（CMD 和 ENTRYPOINT 不同，CMD 可以被 docker run 之后的命令覆盖）。
+    命令分解：
+
+    --ip=0.0.0.0：
+    告诉 Jupyter 监听所有网络接口（而不仅仅是 localhost），
+    这样你才能从容器外部（即你本地电脑的浏览器）访问它。
+    
+    --port=8888：
+    在容器的 8888 端口上运行。
+    
+    --no-browser：
+    不要尝试在容器内部（这个服务器环境）打开一个浏览器。
+    
+    --allow-root：
+    （重要） 默认情况下，Jupyter 不推荐以 root 用户身份运行。
+    由于 Docker 容器默认以 root 运行，这个标志是必需的，用来“允许”这种做法。
+    
+    --NotebookApp.token=：
+    （安全警告） 这会禁用 Jupyter 的 token 认证。
+    这意味着任何能访问你 8888 端口的人都可以直接进入你的 Jupyter Lab。
+    这在本地开发时很方便，但在生产环境中是极其危险的。
+
+----------------------------------------------------------
+
+
+
+----------------------------------------------------------
+Question:
+你之前提到的 关键点:
+”在 docker-compose.yml 中，这个hostname (spark-master) 会被解析到 Master 容器的 IP address“
+这是什么意思？
+
+Gemini:
+这是一个非常棒的问题！这正是 docker-compose 最“神奇”也是最核心的功能之一，它解决了容器之间如何“找到”彼此的难题。
+简单来说，docker-compose 为你的所有服务创建了一个私有的虚拟网络，并在这个网络中提供了一个自动的 DNS 服务（就像一个电话簿）。
+让我用一个“电话簿”的例子来为你分解这个过程：
+
+1. 现实世界的问题：IP 地址会变
+想象一下，你启动了两个容器：spark-master 和 spark-worker。
+Docker 可能会给 spark-master 分配一个随机的 IP 地址，比如 172.18.0.2。
+它可能会给 spark-worker 分配 172.18.0.3。
+问题是：如果你在 spark-worker 的配置里“写死” (hard-code) 172.18.0.2，当你下次重启 docker-compose 时，spark-master 几乎肯定会得到一个新的 IP（比如 172.18.0.5），然后你的 spark-worker 就再也找不到它了。
+
+2. Docker Compose 的解决方案：自动电话簿 (DNS)
+docker-compose 通过以下方式完美地解决了这个问题：
+
+创建网络：当你运行 docker-compose up，它会创建一个新的私有网络（比如叫 my-project_default），然后把你所有的服务（spark-master, spark-worker）都放进这个网络里。
+充当电话簿 (DNS)：docker-compose 在这个网络上运行一个内置的 DNS 服务器。
+自动注册：
+    当 spark-master 容器启动并获得 IP 172.18.0.2 时，docker-compose 的 DNS 会立刻在这个“电话簿”里添加一条记录：
+    "spark-master" (这个名字) <---> 172.18.0.2 (这个 IP)
+
+服务发现 (关键点！)：
+    现在，你的 spark-worker 容器（在同一个网络中）启动了。
+    它的配置（来自 spark-defaults.conf）说：“我需要连接到 spark://spark-master:7077”。
+    spark-worker 的操作系统会向网络大喊：“谁知道 'spark-master' 在哪里？”
+    docker-compose 的 DNS（电话簿）立刻回答：“哦，我知道！'spark-master' 就在 172.18.0.2。”
+    spark-worker 容器现在就知道了 Master 的 IP，并成功地连接到了 172.18.0.2:7077。
+
+总结
+    docker-compose.yml 中的服务名 (如 spark-master)：就像你在手机通讯录里存的**“朋友的名字”**。
+    容器的 IP 地址 (如 172.18.0.2)：就像你朋友真正的电话号码（你从来不记）。
+    ENV 或 .conf 中的配置 (如 spark-master:7077)：就是告诉 Worker：“去通讯录里找一个叫 'spark-master' 的人，然后拨打他的 7077 端口。”
+所以，“spark-master 会被解析到 IP 地址” 这句话的意思是：docker-compose 会自动把 spark-master 这个字符串名字，翻译成 spark-master 容器当前的、实际的 IP 地址。
+这让你可以在配置中始终使用固定的、人类可读的服务名称，而不用担心背后那些动态变化的 IP 地址。

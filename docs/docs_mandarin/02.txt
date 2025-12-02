@@ -1,0 +1,360 @@
+--------------------------------------------------------------------------
+    docker-compose.yml
+--------------------------------------------------------------------------
+
+What is docker-compose.yml
+
+    docker-compose是用来配置多容器Docker Application的YAML文件。
+    它负责运行多个Dockerfile实例（Container）并让他们互相沟通。
+
+    Project 使用 Docker来build environment时，
+    会先写好所有技术的image，例如spark，airflow，postgreSQL，MinIO
+    
+    这些 Dockerfile 经过 build 后会产生 images (1个 Dockerfile = 1个 Image)
+    Image 是静态的, 还没运行
+    
+    这个时候就需要靠 docker-compose 来连接所有的 images 并且负责启动 container。
+    同一个image, 可以运行很多个containers.
+    例如 1个Spark Master, 10个 Workers 都是来自同一个Image.
+
+    Spark有属于自己的 Dockerfile，Airflow 也有属于自己的 Dockerfile
+    docker-compose可以启动一个有Spark和Airflow的环境来让 developer 使用他们。
+    甚至可以决定 spark services应该启动 Master 还是 Worker，和启动多少个 worker。
+
+    docker-compose 负责：
+        - 启动多少个Container (1个master， n个workers)
+        - Container之间的网络连接 (depends_on, networks)
+        - 绑定哪些ports
+        - 读取哪些volume
+
+    如果没有 docker-compose 会怎样？
+        我们需要开 4-5 个 terminal tab，分别输入超级长的命令：
+        Terminal 1: docker run --name spark-master -p 8080:8080 -v ... network ... my-spark-image master
+        Terminal 2: docker run --name spark-worker --link spark-master ... my-spark-image worker
+        ...
+        不仅要手动处理网络连接（让 worker 找到 master），
+        还要每次都挂载 volumes，非常容易出错且难以维护。
+
+    有了 docker-compose，只需要一行命令：
+        `docker-compose up -d`
+        它会自动帮我们构建镜像、启动所有容器、建立好它们之间的网络通讯。
+
+--------------------------------------------------------------------------
+    Deep Dive: The Code Explanation
+--------------------------------------------------------------------------
+
+    docker-compose的语法规则:
+        - 必须使用 space 进行缩进（不能使用 Tab）
+        - sevices下的每个子项必须缩进 2 spaces
+        - YAML 文件对格式非常敏感，缩进错误会导致解析失败
+
+version: '3.8'
+
+    Docker Compose 文件格式的 version (不是 Docker 版本，也不是 Project 版本)
+    不同version的docker-compose写法有点不一样
+
+services:
+
+    services 定义要运行的所有Container
+    每个service 对应 一类container
+    service = image + config (depends_on, ports, volumes, ...)
+
+    这里用了5个services
+    services:
+      spark-master
+      spark-worker
+      spark-history-server
+      spark-connect
+      spark-jupyter
+
+    重要说明:
+    services 的书写顺序不重要
+    实际的启动顺序由 depends_on 依赖关系控制
+    为了确保依赖服务真正就绪，最好配置 healthcheck 和 condition
+
+    Example:
+    spark-worker:
+      depends_on:
+        spark-master:
+          condition: service_healthy
+
+    这告诉 docker-compose：worker 必须在 master 健康检查通过后才能启动
+    这样 compose 会先启动 master，等待其健康状态正常，再启动 worker
+    避免了 worker 连接 master 时出现连接失败的问题
+
+
+container_name:
+
+    它是用来给 Container 指定名字的
+    如果没写这一行，Docker Compose会按照一套默认规则自动给Container命名
+
+    有什么用？
+    避免debug的时候，看到很长很乱或者没看过的container名字
+
+    注意：
+    spark-worker会启动3个，来自同一个service。
+    所以它应该不写container_name，避免名字冲突
+    让Docker Compose自动给worker生成container_name
+    如果写了 container_name，
+    在使用 docker-compose up --scale spark-worker=3 时会直接报错，
+    因为 Docker 不允许重名。
+
+
+image:
+build:
+  context:
+  target:
+
+    image有3种用法
+
+    用法1：
+        首先image会和build一起出现
+        Example：spark-master和spark-jupyter
+
+        image: spark-image
+        build:
+        context: .
+        target: pyspark
+
+        image: spark-jupyter
+        build:
+        context: .
+        target: jupyter-notebook
+        
+        含义：
+        告诉compose，根据build指令去构建一个image, 构建完后给这个image取名字
+
+    用法2：
+        然后当只有image和build时，
+        Example: spark-worker,spark-history,spark-connect
+
+        含义：
+        告诉compose，我不需要构建任何东西。直接去本地镜像库找一个名字叫spark-image的现成image
+
+    用法3：
+        当只有image，且名字是标准名（Docker hub的image）
+        没build，找不到自定义的，并且是标准名
+        compose就会去docker hub下载image
+
+
+entrypoint: ['./entrypoint.sh', '<service>']
+
+    这行代码定义了Container启动时要执行的命令。
+    
+    在这里的用途是决定container的角色，是master/worker/historyserver/connect
+    使用dockerfile构建image时
+    dockerfile会把本地写好的这个sh file复制到Debian环境里，
+    然后compose启动container，把'<service>"作为参数传入 .sh 的 $1 位置
+    来决定container是master还是worker，或是其他
+
+
+depends_on:
+
+    定义 Service之间的启动顺序 Startup Order
+    例如
+    worker depends on master
+    worker需要等master启动完，它才能启动
+    所以会加上service_health的condition
+
+    没有depends on的话
+    worker会报错，连接失败，不过spark会重新尝试连接
+
+
+env_file:
+
+    是一个外挂的配置清单。它让多个containers可以share同一套env setting，既省事又整洁。
+    例如:
+        读取.env.spark，把里面写的variable注入到这个Container的variable
+        相当于把file里的每一行都在container执行一遍
+
+    用处:
+    不需要重复写 SPARK_NO_DAEMONIZE=true
+    例如：
+    spark-master:
+      environment:
+        - SPARK_NO_DAEMONIZE=true
+    spark-worker:
+      environment:
+        - SPARK_NO_DAEMONIZE=true
+    spark-history-server:
+      environment:
+        - SPARK_NO_DAEMONIZE=true
+
+    好处:
+    一处修改，处处生效：
+        如果你以后想加一个全局配置（比如 SPARK_uSER=hadoop），你只需要改 .env.spark 这一个文件，所有服务就自动拥有了这个变量。
+    保持 YAML 整洁：
+        你的 docker-compose.yml 不会被几十行密密麻麻的环境变量占满，看起来更清爽。
+    安全隔离（虽然这里没用到）：
+        通常我们会把密码、API Key 写在 env file 里，并且把这个文件加入 .gitignore，这样就不会不小心把密码传到 GitHub 上了。
+
+    什么是SPARK_NO_DAEMONIZE=true?
+        默认情况：Spark 启动后喜欢把自己变成“守护进程”（后台运行）。
+        Docker 的习惯：Docker 盯着前台进程。如果 Spark 跑去后台了，Docker 以为程序结束了，就会杀死容器。
+        这就话的意思：告诉 Spark，“别去后台，就在前台待着！” —— 这样容器才能一直活着。
+
+    能不能写在 Dockerfile？ 
+    能。对于这个特定的 Docker 项目来说，写在 Dockerfile 里其实更“安全”，
+    因为防止了用户忘记配置导致容器秒退。
+    
+    为什么要写在 env？ 为了解耦（Decoupling）。 
+    作者希望镜像 (spark-image) 只是一个单纯的 Spark 安装包，
+    而把“如何让它在 Docker 容器里存活”的逻辑，留给了编排文件 (docker-compose) 去控制。
+
+
+volumes: 
+
+    这是挂载本地folder到container里,
+    
+    语法结构:
+    左边 Host       = 本地电脑上的文件夹
+    中间 :          = 连接/区分
+    右边 Container  = linux container里的文件夹
+
+    这两个文件夹的内容是完全同步的。
+
+    举例：
+    在电脑的 ./data 里放一个 test.csv，
+    容器里的 /opt/spark/data 瞬间就会出现这个文件
+    反之亦然
+
+    应用:
+    - ./data:/opt/spark/data
+
+        作用：这是给 Spark 喂数据的地方。
+        
+        场景：想分析一个 sales.csv
+        没有 Volume：得用 docker cp 命令把文件复制进容器，或者重新构建镜像把文件打进去（太麻烦）
+        有   Volume：直接在 Windows/Mac 的文件管理器里，把 sales.csv 拖进项目里的 data 文件夹
+                    然后在代码里写 spark.read.csv("/opt/spark/data/sales.csv")。搞定！
+
+    - ./spark_apps:/opt/spark/apps
+
+        作用：这是放 Python 脚本 (.py 文件) 的地方。
+        
+        场景：需要提交一个任务 spark-submit.
+        把写好的 analysis.py 放在本地的 spark_apps 文件夹里。
+        然后在 Master 容器里执行：spark-submit /opt/spark/apps/analysis.py
+        最棒的是：如果发现代码有 bug，你在 VS Code 里修改并保存本地文件，容器里立刻生效
+                你不需要重启容器，直接再次运行命令即可。这叫 Hot-Swapping（热替换）
+
+    - ./notebooks:/opt/notebooks
+
+        作用：这是 Jupyter Notebook 的存档点。
+
+        重要性：数据持久化 (Persistence)
+        容器是“易碎”的。如果不小心删除了 spark-jupyter 容器，里面所有的文件都会消失。
+        但是！因为挂载了这个 Volume，.ipynb 笔记其实是保存在硬盘上的。
+        容器炸了没事，代码还在。
+
+    - spark-logs:/opt/spark/spark-events
+
+        注意：这一行左边没有 ./
+        这说明它是一个 Named Volume，不是电脑上的普通文件夹(上面提过)
+
+        作用：这是 Master/Worker 和 History Server 之间的 “共享信箱”。
+        
+        Master/Worker (生产者)：把运行时的二进制日志写进去。
+        History Server (消费者)：从这里面读日志，生成网页图表。
+        如果不挂载这个共享卷，History Server 就像个瞎子，什么都看不到。
+
+        为什么每个 Service 都要写一遍？
+            会发现 Master, Worker, Connect, Jupyter 下面都有这几行。
+            这是为了 环境一致性 (Environment Consistency)。
+            
+            路径欺骗：不管你的代码是在 Jupyter 里跑（Client 模式），
+            还是被分发到 Worker 上跑（Cluster 模式），
+            大家看到的路径 永远都是 /opt/spark/data/...。
+            这样就不用在代码里写复杂的判断逻辑
+            比如 if(我是worker) read(...) else read(...)
+
+
+ports:
+
+    语法规则:
+    左边 = localhost port
+    中间 = ：映射
+    右边 = container port
+
+    意思是
+    监听电脑上的 xxxx port。如果有任何流量发到这个端口，请把它转发给容器里的 yyyy port
+    所以，当在浏览器输入 http://localhost:xxxx 时，实际上是在访问容器里的 yyyy 服务
+
+    重点：
+    每个service都有自己的port
+
+    localhost的port是自己取的
+    container的port是developer取的
+
+    container的ports 他们之间不会冲突，
+    因为每个 Docker 容器都有独立的网络命名空间，形成隔离的网络环境。
+
+    误区：
+    port不是给container用的，因为container的service已经写好了port是什么，
+    其实 ports 是写给自己用的，我们定义前面的port，就可以到自己浏览器打开对应的服务
+
+    Ports:
+        Master UI      (9090:8080)
+        Spark Job UI   (4040:4040)
+        RPC            (7077:7077)
+        Worker UI      (8081:8081)
+        History Server (18080:18080)
+        Jupyter Lab    (8888:8888)
+
+
+healthcheck:
+
+    它解决了 Docker 世界里最大的谎言：“容器启动了 (Started) = 服务能用了 (Ready)”。
+
+    为什么要写它？（解决“僵尸”问题）
+        没有 Healthcheck，Docker 很笨：
+        只要容器的主进程（PID 1）还在跑，Docker 就认为它状态是 Up（健康的）。
+        但在现实中：Spark Master 是 Java 应用。
+        它可能进程起来了，但因为内存溢出卡住了，或者还在加载几百个配置文件，
+        或者 Web UI 还没渲染出来。这时候它其实是**“脑死亡”或者“还在穿衣服”**的状态。
+    这时候如果有 Worker 连上来，或者你尝试访问网页，都会失败。
+
+    Healthcheck作用： Docker 会定期在容器内部执行一个命令（比如 curl），问应用：“你还好吗？”
+        如果应用回答“我很好（Exit Code 0）”，Docker 标记为 healthy。
+        如果应用不理人或报错（Exit Code 1），Docker 标记为 unhealthy。
+
+    它与 depends_on 的完美配合
+        Docker：启动 Master 容器。
+        Healthcheck：(第0秒) 刚启动，根据 start_period，先不检查，或者检查失败也不计数。
+        Master：拼命加载 Java 库，初始化端口... (第3秒) 终于把 8080 端口打开了。
+        Healthcheck：(第5秒) 执行 curl... 成功！ 返回 0。
+        Docker：把 Master 状态从 starting 改为 healthy。
+        Docker：收到信号，立刻启动 Worker 容器。
+        Worker：一出生就去找 Master，立刻连接成功。
+        如果没有 Healthcheck： Worker 在第 1 秒就启动了，然后报错连不上，一直重试到第 5 秒。
+
+
+volumes:
+  spark-logs:
+
+    这里定义的volumes和service里的volumes不同
+
+    这个volumes是 Docker Volume，由 Docker 管理并持久化存储在宿主机
+    含义：告诉 Docker 创建一个名为 "spark-logs" 的持久化数据卷
+    特点：
+    - Docker 托管存储
+    - 在 Linux 系统中通常位于 /var/lib/docker/volumes/... 
+    - 数据独立于容器生命周期，容器删除后数据仍然保留
+    
+    注意：
+    Docker 必须运行在 Linux 内核上
+        在 Windows/Mac 上，Docker 实际上是在隐藏的 VM 中运行
+        因此这个 spark-logs 在 Windows C 盘中是直接找不到的
+
+    用途说明：
+    为了让 services 能互通，我们需要一个独立于容器之外的存储空间。
+    这个spark-logs是持久化的，不存在container里
+
+    Master 和 Worker（生产者）：
+        它们运行任务时，会产生很多事件日志（Event Logs）。
+        它们把日志写进容器里的 /opt/spark/spark-events。
+
+    History Server（消费者）：
+        它的唯一工作就是盯着容器里的/opt/spark/spark-events，
+        读取这些日志，生成可视化的网页供用户查看。
+

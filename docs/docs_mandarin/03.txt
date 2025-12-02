@@ -1,0 +1,132 @@
+
+--------------------------------------------------------------------------------------------
+    Makefile Deep Dive: Command Explanation
+--------------------------------------------------------------------------------------------
+
+Makefile 的核心作用是将复杂的 Docker 命令封装成简单的快捷键。
+我们将这些命令分为四类来理解：
+
+--------------------------------------------------------------------------------------------
+1. Build Image
+
+    这类命令用于根据 Dockerfile 生成镜像。
+
+    build: docker compose build
+
+        标准构建。Docker 会读取 docker-compose.yml 里的 build 指令。
+
+        它会利用 Docker Layer Caching（缓存）。
+        如果你之前构建过，且 Dockerfile 没变，它会直接复用旧层，速度极快。
+
+        修改了 Python 代码（因为挂载了 volume）通常不需要 build。
+        只有修改了 Dockerfile 或者 requirements.txt 时才运行。
+
+
+    build-nc: docker compose build --no-cache
+
+        nc = No Cache。
+        强制 Docker 忽略所有缓存，从头开始构建每一层。
+        当你发现构建出来的环境有问题，或者 apt-get update 获取不到最新包时，用这个命令来确保“彻底重做”。
+
+
+    build-progress: docker compose build --no-cache --progress=plain
+
+        无缓存构建 + 纯文本日志输出。
+        默认的 Docker 构建界面会折叠日志，只显示进度条。
+        --progress=plain 会把每一行 log（比如 pip install 的详细报错）都打印出来。
+        Debug 专用。当 build 报错，但你看不到具体错哪儿的时候，用这个。
+
+
+--------------------------------------------------------------------------------------------
+2. Lifecycle & Cleanup
+
+    这类命令用于停止容器和清理垃圾。
+
+    clean: docker compose down --rmi="all" --volumes
+
+        down: 停止并移除容器。
+        --rmi="all": Remove Images。删除所有相关的镜像。
+        --volumes  : 删除所有挂载的 Named Volumes (即删除 spark-logs)。
+        当你想把整个项目重置回“出厂设置”，连镜像都要重新下载/构建时使用。
+
+
+    down: docker compose down --volumes --remove-orphans
+
+        --volumes       : 连同 spark-logs 数据卷一起删掉（彻底清空日志）。
+        --remove-orphans: 清理“孤儿容器”。（比如你修改了 yaml，删除了 spark-connect 服务，
+                          如果不加这个参数，旧的 spark-connect 容器会一直僵尸般地留在那里，加了就会被自动清理）。
+        每次结束工作时运行。
+
+    
+    stop: docker compose stop
+
+        暂停。
+        只停止容器运行，但不删除容器，也不删除网络和数据。
+        暂时休息一下，等会儿还要继续跑，不想丢失容器里的临时状态。
+
+    
+--------------------------------------------------------------------------------------------
+3. Run Strategies
+
+    这类命令用于以不同模式启动集群。注意所有的 run 命令都带了 make down 前缀，这是为了确保“先清理旧的，再启动新的”，防止端口冲突。
+
+    run: make down && docker compose up
+
+        前台启动。
+        日志会直接输出到当前终端窗口。
+        调试阶段。
+        你想实时盯着日志看有没有报错。按 Ctrl+C 会停止容器。
+
+
+    run-d: make down && docker compose up -d
+
+        d = Detached (后台模式)。容器在后台静默运行。
+        最常用的开发模式。
+        启动后，终端控制权回到你手里，你可以继续输入其他命令。
+
+
+    run-scaled: make down && docker compose up --scale spark-worker=3
+
+        扩展启动。
+        启动 1 个 Master 和 3 个 Worker。
+        测试分布式计算，观察 Spark 如何把任务分配给多个节点。
+
+
+    run-generated: make down && sh ./generate-docker-compose.sh 3 && docker compose -f docker-compose.generated.yml up
+
+        这是一种高级用法。
+        它先运行 sh ./generate-docker-compose.sh 3（这是一个自定义脚本，用来动态生成一个新的 yaml 文件）。
+        然后使用 -f 指定那个新生成的文件来启动。
+        场景: 这通常是 --scale 的替代方案。有时候 --scale 不够灵活（比如想给每个 worker 指定不同的环境变量），就会写脚本动态生成 yaml。
+
+
+--------------------------------------------------------------------------------------------
+4. Interaction & Jobs
+
+    这类命令用于向运行中的集群提交任务。
+
+    submit: docker exec spark-master spark-submit ... ./apps/$(app)
+
+        通用提交命令。
+            docker exec spark-master    进入 Master 容器。
+            spark-submit ...            执行 Spark 提交命令。
+            --deploy-mode client        让 Driver 程序在 Master 容器内运行，而不是在 Worker 上。
+            $(app)                      Makefile 变量。
+
+        用法: 
+        make submit app=analysis.py
+            Make 会自动把 analysis.py 填入 $(app) 的位置。
+            最终执行的是提交 apps/analysis.py。
+    
+    
+    submit-py-pi:
+    
+        含义: 运行官方的 $\pi$ (Pi) 计算示例。
+        场景: Smoke Test (冒烟测试)。用来验证集群是不是真的能干活。如果这个跑通了，说明环境搭建成功。
+    
+
+    rm-results: rm -r data/results/*
+        
+        含义: 这是一个本地 Shell 命令（不是 Docker 命令）。删除本地 data/results 文件夹下的所有内容。
+        场景: 每次跑新任务前，清理掉上一次任务生成的 CSV 或 Parquet 结果文件。
+
