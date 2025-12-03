@@ -1,4 +1,4 @@
-FROM python:3.11-bullseye as spark-base
+FROM python:3.11-bullseye AS spark-base
 
     ARG SPARK_VERSION=3.4.0
 
@@ -34,7 +34,7 @@ FROM python:3.11-bullseye as spark-base
 
 
 
-FROM spark-base as pyspark-base
+FROM spark-base AS pyspark-base
 
     # Install python deps
     COPY requirements/requirements.txt .
@@ -47,7 +47,7 @@ FROM spark-base as pyspark-base
     ENV PYTHONPATH=$SPARK_HOME/python/:$PYTHONPATH
 
 
-FROM pyspark-base as pyspark
+FROM pyspark-base AS pyspark
 
     # Code below, "SPARK_MASTER" already set in the spark-defaults.conf
     # ENV SPARK_MASTER="spark://spark-master:7077"
@@ -61,11 +61,12 @@ FROM pyspark-base as pyspark
 
     # Copy appropriate entrypoint script
     COPY entrypoint.sh .
+    RUN chmod +x ./entrypoint.sh
     ENTRYPOINT ["./entrypoint.sh"]
 
 
 
-FROM pyspark-base as jupyter-notebook
+FROM pyspark-base AS jupyter-notebook
 
     ARG jupyterlab_version=4.0.1
 

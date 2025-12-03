@@ -1,7 +1,7 @@
 # requirements/requirements.in
 
 # ---- pyspark (must match Dockerfile SPARK_VERSION) ----
-# ---- others (run pip-compile-multi to update to the latest versions) ----
+# ---- others (run pip-compile to update to the latest versions) ----
 
 pyspark==3.4.0
 ipython

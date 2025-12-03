@@ -1,4 +1,4 @@
-version: '3.8'
+# version: '3.8'
 
 services:
 
@@ -24,10 +24,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 3
-
   
   {workers}
-
 
   spark-history-server:
     container_name: spark-history
