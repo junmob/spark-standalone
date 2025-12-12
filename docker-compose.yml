@@ -16,9 +16,9 @@ services:
       - ./spark_apps:/opt/spark/apps
       - spark-logs:/opt/spark/spark-events
     ports:
-      - '9090:8080'
-      - '4041:4040'
-    # - '7077:7077'
+      - '9090:8080'     # Master UI
+      - '4041:4040'     # Spark Driver
+    # - '7077:7077'     # Connection with Worker
     # - '15000:15000'
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
@@ -57,7 +57,7 @@ services:
     volumes:
       - spark-logs:/opt/spark/spark-events
     ports:
-      - '18080:18080'
+      - '18080:18080'     # Spark History Server UI
 
 
   # spark-connect:
@@ -87,8 +87,10 @@ services:
       context: .
       target: jupyter-notebook
     # depends_on:
+      # Comment spark-master cuz want to setting up jupyter faster, 
+      # and it is not neccessary depends on master.
       # spark-master:
-      #   condition: service_healthy
+      #   condition: service_healthy      
       # spark-connect:
       #   condition: service_started
     volumes:
@@ -97,8 +99,8 @@ services:
       - ./notebooks:/opt/notebooks
       - spark-logs:/opt/spark/spark-events
     ports:
-      - '8888:8888'
-      - '4040:4040'
+      - '8888:8888'     # Jupyter Notebook
+      - '4040:4040'     # Spark Driver
 
 
 volumes:
